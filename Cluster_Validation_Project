@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+import pandas as pd
+import numpy as np
+import csv 
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.preprocessing import StandardScaler
+
+insulin_data = pd.read_csv('InsulinData.csv', low_memory=False)
+cgm_data = pd.read_csv('CGMData.csv', low_memory=False)
+
+# Extracting meal start times from InsulinData (non-zero, non-NaN 'BWZ Carb Input (grams)')
+meal_times = insulin_data[pd.notnull(insulin_data['BWZ Carb Input (grams)']) & (insulin_data['BWZ Carb Input (grams)'] > 0)].copy()
+
+meal_times['datetime'] = pd.to_datetime(meal_times['Date'] + ' ' + meal_times['Time'])
+
+# Extract glucose data corresponding to meal time (tm)
+cgm_data['datetime'] = pd.to_datetime(cgm_data['Date'] + ' ' + cgm_data['Time'])
+cgm_data = cgm_data.interpolate(method='backfill',limit_direction = 'backward')
+
+def extract_meal_data(meal_times, cgm_data):
+    meal_data_list = []
+    carb_data_list = []
+
+    for tm in meal_times['datetime']:
+        tm_minus_30min = tm - pd.Timedelta(minutes=30)
+        tm_plus_2hrs = tm + pd.Timedelta(hours=2)
+        
+        meal_data = cgm_data[(cgm_data['datetime'] >= tm_minus_30min) & (cgm_data['datetime'] <= tm_plus_2hrs)]
+        
+        future_meal = meal_times[(meal_times['datetime'] > tm) & (meal_times['datetime'] < tm_plus_2hrs)]
+        
+        carb_data = meal_times[(meal_times['datetime'] >= tm_minus_30min) & (meal_times['datetime'] <= tm_plus_2hrs)]
+        
+        if not future_meal.empty:
+            # Another meal exists at tp, replace tm with tp
+            tp = future_meal['datetime'].iloc[0]
+            meal_data = cgm_data[(cgm_data['datetime'] >= tp - pd.Timedelta(minutes=30)) & (cgm_data['datetime'] <= tp + pd.Timedelta(hours=2))]
+            carb_data = meal_times[(meal_times['datetime'] >= tp - pd.Timedelta(minutes=30)) & (meal_times['datetime'] <= tp + pd.Timedelta(hours=2))]
+        
+        elif not meal_times[meal_times['datetime'] == tm_plus_2hrs].empty:
+            meal_data = cgm_data[(cgm_data['datetime'] >= tm + pd.Timedelta(hours=1, minutes=30)) & (cgm_data['datetime'] <= tm + pd.Timedelta(hours=4))]
+            carb_data = meal_times[(meal_times['datetime'] >= tm + pd.Timedelta(hours=1, minutes=30)) & (meal_times['datetime'] <= tm + pd.Timedelta(hours=4))]
+        
+        if len(meal_data) == 30:  # Ensure exactly 30 readings (every 5 mins)
+            meal_data_list.append(meal_data['Sensor Glucose (mg/dL)'].values)
+            carb_data_list.append(carb_data['BWZ Carb Input (grams)'].iloc[0])
+    
+    meal_data_matrix = np.array(meal_data_list, dtype=object)
+    carb_data_matrix = np.array(carb_data_list, dtype=object)
+    return meal_data_matrix, carb_data_matrix
+
+meal_data_matrix, carb_data_matrix= extract_meal_data(meal_times, cgm_data)
+
+def extract_features(data_matrix):
+    features = np.apply_along_axis(lambda row: [
+        #np.argmax(row) * 5,
+        np.mean(row),
+        np.var(row),
+        #(np.max(row) - row[0]) / np.std(row) if np.std(row) != 0 else 0,
+        *np.abs(np.fft.fft(row)[:4]),
+        np.mean(np.abs(np.diff(row,n=1))), 
+        np.mean(np.abs(np.diff(np.diff(row, n=1), n=1)))
+    ], axis=1, arr=data_matrix)
+    return features
+
+
+meal_features = extract_features(meal_data_matrix)
+
+# Scale the features
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(meal_features)
+
+# Derive min and max carb values
+min_carb = carb_data_matrix.min()
+max_carb = carb_data_matrix.max()
+
+# Calculate bin size and number of bins
+bin_size = 20 
+n_bins = int((max_carb - min_carb) / bin_size)
+# Create bins and digitize the data
+bins = np.linspace(min_carb, max_carb, n_bins + 1)
+ground_truth_labels = np.digitize(carb_data_matrix, bins) -1
+
+#bin_labels = range(n_bins)
+#ground_truth_labels = pd.cut(carb_data_matrix, bins=bins, labels=bin_labels, include_lowest=True)
+#ground_truth_labels = np.array(ground_truth_labels)
+
+n_clusters = n_bins
+
+kmeans = KMeans(n_clusters=n_clusters).fit(scaled_features)
+#kmeans_labels = kmeans.labels_
+kmeans_labels = kmeans.fit_predict(scaled_features)
+kmeans_centers = kmeans.cluster_centers_
+n_clusters_kmeans = kmeans.n_clusters
+kmeans_sse = kmeans.inertia_
+
+dbscan = DBSCAN(eps=0.5, min_samples=5).fit(scaled_features)
+#dbscan_labels = dbscan.labels_
+dbscan_labels = dbscan.fit_predict(scaled_features)
+n_clusters_dbscan = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+
+def dbscan_sse(data, labels):
+    unique_labels = set(labels)
+    sse = 0
+
+    for label in unique_labels:
+        if label == -1:
+            continue # Skip noise points
+        cluster_points = data[labels == label]
+        centroid = np.mean(cluster_points, axis=0)
+        sse += np.sum((cluster_points - centroid) ** 2)
+    return sse
+dbscan_sse = dbscan_sse(scaled_features, dbscan_labels)
+
+def create_ground_truth_matrix(true_labels, cluster_labels, n_bins):
+    ground_truth_matrix = np.zeros((len(set(cluster_labels)), n_bins))
+    for cluster_id in set(cluster_labels):
+        if cluster_id == -1:
+            continue
+        for bin_id in range(n_bins):
+            ground_truth_matrix[cluster_id, bin_id] = np.sum(
+                (cluster_labels == cluster_id) & (true_labels == bin_id))
+    
+    return ground_truth_matrix
+
+def calculate_entropy(gtm):
+    total_points = np.sum(gtm)
+    total_entropy = 0
+
+    for cluster in gtm:
+        cluster_size = np.sum(cluster)
+        if cluster_size == 0:
+            continue  # Skip empty clusters
+        cluster_entropy = 0
+        for bin_count in cluster:
+            if bin_count > 0:
+                p = bin_count / cluster_size
+                cluster_entropy -= p * np.log2(p)  # Entropy for the cluster
+        # Weight the cluster entropy by the size of the cluster
+        weighted_entropy = (cluster_size / total_points) * cluster_entropy
+        total_entropy += weighted_entropy
+    
+    return total_entropy
+
+def calculate_purity(gtm):
+    total_points = np.sum(gtm)
+    total_purity = 0
+
+    for cluster in gtm:
+        cluster_size = np.sum(cluster)
+        if cluster_size == 0:
+            continue  # Skip empty clusters
+        # Purity is the max bin count over the cluster size
+        cluster_purity = np.max(cluster) / cluster_size
+        # Weight the purity by the cluster size
+        weighted_purity = (cluster_size / total_points) * cluster_purity
+        total_purity += weighted_purity
+    
+    return total_purity
+
+
+kmeans_gtm = create_ground_truth_matrix(ground_truth_labels, kmeans_labels, n_bins)
+kmeans_entropy = calculate_entropy(kmeans_gtm)
+kmeans_purity = calculate_purity(kmeans_gtm)
+dbscan_gtm = create_ground_truth_matrix(ground_truth_labels, dbscan_labels, n_bins)
+dbscan_entropy = calculate_entropy(dbscan_gtm)
+dbscan_purity = calculate_purity(dbscan_gtm)
+
+# Save the results in a CSV file without headers
+results = [
+    [kmeans_sse, dbscan_sse, kmeans_entropy, dbscan_entropy, kmeans_purity, dbscan_purity]
+]
+
+with open('Result.csv', 'w', newline='') as csvfile:
+    writer = csv.writer(csvfile)
+    writer.writerows(results)
+
+
